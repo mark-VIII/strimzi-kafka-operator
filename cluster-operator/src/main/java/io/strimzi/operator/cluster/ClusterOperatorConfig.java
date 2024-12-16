@@ -35,6 +35,7 @@ import static io.strimzi.operator.common.config.ConfigParameterParser.NAMESPACE_
 import static io.strimzi.operator.common.config.ConfigParameterParser.STRING;
 import static io.strimzi.operator.common.config.ConfigParameterParser.parseFeatureGates;
 
+
 /**
  * Cluster Operator configuration
  */
@@ -54,6 +55,11 @@ public class ClusterOperatorConfig {
      * Configures the Kafka Connect container images
      */
     public static final String STRIMZI_KAFKA_CONNECT_IMAGES = "STRIMZI_KAFKA_CONNECT_IMAGES";
+
+    /**
+     * Configures the Kafka Mirror Maker container images
+     */
+    public static final String STRIMZI_KAFKA_MIRROR_MAKER_IMAGES = "STRIMZI_KAFKA_MIRROR_MAKER_IMAGES";
 
     /**
      * Configures the Kafka Mirror Maker 2 container images
@@ -207,6 +213,16 @@ public class ClusterOperatorConfig {
     public static final ConfigParameter<Boolean> POD_SET_RECONCILIATION_ONLY = new ConfigParameter<>("STRIMZI_POD_SET_RECONCILIATION_ONLY", BOOLEAN, "false", CONFIG_VALUES);
 
     /**
+     * Enables Stretch Mode for StrimziPodSetController
+     */
+    public static final ConfigParameter<Boolean> STRETCH_MODE = new ConfigParameter<>("STRIMZI_STRETCH_MODE", BOOLEAN, "false", CONFIG_VALUES);
+
+    /**
+     * Environment Variable for K8sClusters
+     */
+    public static final ConfigParameter<String> K8S_CLUSTERS = new ConfigParameter<>("STRIMZI_K8S_CLUSTERS", STRING, null, CONFIG_VALUES);
+
+    /**
      * Indicates the size of the StrimziPodSetController work queue
      */
     public static final ConfigParameter<Integer> POD_SET_CONTROLLER_WORK_QUEUE_SIZE = new ConfigParameter<>("STRIMZI_POD_SET_CONTROLLER_WORK_QUEUE_SIZE", INTEGER, "1024", CONFIG_VALUES);
@@ -255,6 +271,20 @@ public class ClusterOperatorConfig {
     private final KafkaVersion.Lookup versions;
 
     /**
+     * Variable for k8sClusters
+     */
+    private Map<String, ClusterInfo> k8sClusters;
+
+    /**
+     * Gets the Linked Kubernetes cluster details.
+     *
+     * @return The k8sClusters list.
+     */
+    public Map<String, ClusterInfo> getK8sClusters() {
+        return k8sClusters;
+    }
+
+    /**
      * Logs warnings for removed / deprecated environment variables
      *
      * @param map   map from which loading configuration parameters
@@ -283,7 +313,7 @@ public class ClusterOperatorConfig {
 
     public static ClusterOperatorConfig buildFromMap(Map<String, String> map) {
         warningsForRemovedEndVars(map);
-        KafkaVersion.Lookup lookup = parseKafkaVersions(map.get(STRIMZI_KAFKA_IMAGES), map.get(STRIMZI_KAFKA_CONNECT_IMAGES), map.get(STRIMZI_KAFKA_MIRROR_MAKER_2_IMAGES));
+        KafkaVersion.Lookup lookup = parseKafkaVersions(map.get(STRIMZI_KAFKA_IMAGES), map.get(STRIMZI_KAFKA_CONNECT_IMAGES), map.get(STRIMZI_KAFKA_MIRROR_MAKER_IMAGES), map.get(STRIMZI_KAFKA_MIRROR_MAKER_2_IMAGES));
         return buildFromMap(map, lookup);
 
     }
@@ -296,6 +326,7 @@ public class ClusterOperatorConfig {
      * @return  Cluster Operator configuration instance
      */
     public static ClusterOperatorConfig buildFromMap(Map<String, String> map, KafkaVersion.Lookup lookup) {
+        warningsForRemovedEndVars(map);
 
         Map<String, String> envMap = new HashMap<>(map);
 
@@ -303,6 +334,10 @@ public class ClusterOperatorConfig {
         envMap.keySet().retainAll(ClusterOperatorConfig.keyNames());
 
         Map<String, Object> generatedMap = ConfigParameter.define(envMap, CONFIG_VALUES);
+
+        // Ensure STRIMZI_K8S_CLUSTERS is included
+        generatedMap.put(K8S_CLUSTERS.key(), System.getenv(K8S_CLUSTERS.key()));
+
         return new ClusterOperatorConfig(generatedMap, lookup);
     }
 
@@ -314,9 +349,40 @@ public class ClusterOperatorConfig {
      * @param map Map containing configurations and their respective values
      */
 
-    private ClusterOperatorConfig(Map<String, Object> map, KafkaVersion.Lookup lookup) {
+    private ClusterOperatorConfig(Map<String, Object> configMap, KafkaVersion.Lookup lookup) {
         this.versions = lookup;
-        this.map = map;
+        this.map = configMap;
+
+        this.k8sClusters = parseK8SClusters((String) configMap.get(K8S_CLUSTERS.key()));
+    }
+
+    // I think I should Optimize this, Not really happy with the way I extract
+    // Secret. This should work for the time being. This is really a brute force
+    // Approach that can be Optimized to make it more efficient.
+    private Map<String, ClusterInfo> parseK8SClusters(String clustersEnvVar) {
+        Map<String, ClusterInfo> clusters = new HashMap<>();
+        if (clustersEnvVar != null) {
+            String[] entries = clustersEnvVar.split("\n");
+            for (String entry : entries) {
+                String[] keyValue = entry.split("=", 2);
+                if (keyValue.length == 2) {
+                    String[] clusterAndField = keyValue[0].split("\\.", 2);
+                    if (clusterAndField.length == 2) {
+                        String clusterName = clusterAndField[0];
+                        String field = clusterAndField[1];
+                        clusters.computeIfAbsent(clusterName, k -> new ClusterInfo(null, null));
+                        ClusterInfo clusterInfo = clusters.get(clusterName);
+
+                        if ("url".equals(field)) {
+                            clusters.put(clusterName, new ClusterInfo(keyValue[1], clusterInfo.getSecret()));
+                        } else if ("secret".equals(field)) {
+                            clusters.put(clusterName, new ClusterInfo(clusterInfo.getUrl(), keyValue[1]));
+                        }
+                    }
+                }
+            }
+        }
+        return clusters;
     }
 
     /**
@@ -337,10 +403,11 @@ public class ClusterOperatorConfig {
         return (T) this.map.get(value.key());
     }
 
-    private static KafkaVersion.Lookup parseKafkaVersions(String kafkaImages, String connectImages, String mirrorMaker2Images) {
+    private static KafkaVersion.Lookup parseKafkaVersions(String kafkaImages, String connectImages, String mirrorMakerImages, String mirrorMaker2Images) {
         KafkaVersion.Lookup lookup = new KafkaVersion.Lookup(
                 Util.parseMap(kafkaImages),
                 Util.parseMap(connectImages),
+                Util.parseMap(mirrorMakerImages),
                 Util.parseMap(mirrorMaker2Images));
 
         String image = "";
@@ -354,6 +421,10 @@ public class ClusterOperatorConfig {
             image = "Kafka Connect";
             envVar = STRIMZI_KAFKA_CONNECT_IMAGES;
             lookup.validateKafkaConnectImages(lookup.supportedVersions());
+
+            image = "Kafka Mirror Maker";
+            envVar = STRIMZI_KAFKA_MIRROR_MAKER_IMAGES;
+            lookup.validateKafkaMirrorMakerImages(lookup.supportedVersions());
 
             image = "Kafka Mirror Maker 2";
             envVar = STRIMZI_KAFKA_MIRROR_MAKER_2_IMAGES;
@@ -447,7 +518,6 @@ public class ClusterOperatorConfig {
             return new ClusterOperatorConfig(this.map, versions);
         }
     }
-
 
     /**
      * @return  namespaces in which the operator runs and creates resources
@@ -562,6 +632,13 @@ public class ClusterOperatorConfig {
     }
 
     /**
+     * @return Indicates whether Stretch Mode is enabled
+     */
+    public boolean isStretchMode() {
+        return get(STRETCH_MODE);
+    }
+
+    /**
      * @return Returns the size of the StrimziPodSetController work queue
      */
     public int getPodSetControllerWorkQueueSize() {
@@ -618,6 +695,7 @@ public class ClusterOperatorConfig {
                 "\n\tzkAdminSessionTimeoutMs=" + getZkAdminSessionTimeoutMs() +
                 "\n\tdnsCacheTtlSec=" + getDnsCacheTtlSec() +
                 "\n\tpodSetReconciliationOnly=" + isPodSetReconciliationOnly() +
+                "\n\tstretchMode=" + isStretchMode() +
                 "\n\tpodSetControllerWorkQueueSize=" + getPodSetControllerWorkQueueSize() +
                 "\n\toperatorName='" + getOperatorName() + '\'' +
                 "\n\tpodSecurityProviderClass='" + getPodSecurityProviderClass() + '\'' +

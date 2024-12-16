@@ -36,6 +36,9 @@ import io.fabric8.kubernetes.api.model.rbac.RoleRef;
 import io.fabric8.kubernetes.api.model.rbac.RoleRefBuilder;
 import io.fabric8.kubernetes.api.model.rbac.Subject;
 import io.fabric8.kubernetes.api.model.rbac.SubjectBuilder;
+import io.fabric8.kubernetes.client.Config;
+import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.KubernetesClientBuilder;
 import io.fabric8.openshift.api.model.Route;
 import io.fabric8.openshift.api.model.RouteBuilder;
 import io.strimzi.api.kafka.model.common.CertAndKeySecretSource;
@@ -67,7 +70,9 @@ import io.strimzi.api.kafka.model.kafka.quotas.QuotasPluginStrimzi;
 import io.strimzi.api.kafka.model.kafka.tieredstorage.TieredStorage;
 import io.strimzi.api.kafka.model.nodepool.KafkaNodePoolStatus;
 import io.strimzi.api.kafka.model.podset.StrimziPodSet;
+import io.strimzi.api.kafka.model.podset.StrimziPodSetBuilder;
 import io.strimzi.certs.CertAndKey;
+import io.strimzi.operator.cluster.ClusterInfo;
 import io.strimzi.operator.cluster.ClusterOperatorConfig;
 import io.strimzi.operator.cluster.model.cruisecontrol.CruiseControlMetricsReporter;
 import io.strimzi.operator.cluster.model.jmx.JmxModel;
@@ -78,6 +83,8 @@ import io.strimzi.operator.cluster.model.metrics.MetricsModel;
 import io.strimzi.operator.cluster.model.metrics.SupportsMetrics;
 import io.strimzi.operator.cluster.model.securityprofiles.ContainerSecurityProviderContextImpl;
 import io.strimzi.operator.cluster.model.securityprofiles.PodSecurityProviderContextImpl;
+import io.strimzi.operator.cluster.operator.resource.ResourceOperatorSupplier;
+import io.strimzi.operator.cluster.operator.resource.kubernetes.SecretOperator;
 import io.strimzi.operator.common.Annotations;
 import io.strimzi.operator.common.Reconciliation;
 import io.strimzi.operator.common.Util;
@@ -90,6 +97,7 @@ import io.vertx.core.json.JsonObject;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
@@ -113,6 +121,8 @@ public class KafkaCluster extends AbstractModel implements SupportsMetrics, Supp
     private static final String ENV_VAR_KAFKA_METRICS_ENABLED = "KAFKA_METRICS_ENABLED";
     private static final String ENV_VAR_STRIMZI_OPA_AUTHZ_TRUSTED_CERTS = "STRIMZI_OPA_AUTHZ_TRUSTED_CERTS";
     private static final String ENV_VAR_STRIMZI_KEYCLOAK_AUTHZ_TRUSTED_CERTS = "STRIMZI_KEYCLOAK_AUTHZ_TRUSTED_CERTS";
+    private final ClusterOperatorConfig clusterOperatorConfig;
+    private final SecretOperator secretOperator;
 
     // For port names in services, a 'tcp-' prefix is added to support Istio protocol selection
     // This helps Istio to avoid using a wildcard listener and instead present IP:PORT pairs which effects
@@ -124,10 +134,7 @@ public class KafkaCluster extends AbstractModel implements SupportsMetrics, Supp
     protected static final String REPLICATION_PORT_NAME = "tcp-replication";
     protected static final int KAFKA_AGENT_PORT = 8443;
     protected static final String KAFKA_AGENT_PORT_NAME = "tcp-kafkaagent";
-    /**
-     * Port number used for control plane
-     */
-    public static final int CONTROLPLANE_PORT = 9090;
+    protected static final int CONTROLPLANE_PORT = 9090;
     protected static final String CONTROLPLANE_PORT_NAME = "tcp-ctrlplane"; // port name is up to 15 characters
 
     /**
@@ -266,9 +273,11 @@ public class KafkaCluster extends AbstractModel implements SupportsMetrics, Supp
      * @param resource Kubernetes resource with metadata containing the namespace and cluster name
      * @param sharedEnvironmentProvider Shared environment provider
      */
-    private KafkaCluster(Reconciliation reconciliation, HasMetadata resource, SharedEnvironmentProvider sharedEnvironmentProvider) {
+    private KafkaCluster(Reconciliation reconciliation, HasMetadata resource, SharedEnvironmentProvider sharedEnvironmentProvider, ClusterOperatorConfig clusterOperatorConfig, ResourceOperatorSupplier supplier) {
         super(reconciliation, resource, KafkaResources.kafkaComponentName(resource.getMetadata().getName()), COMPONENT_TYPE, sharedEnvironmentProvider);
 
+        this.clusterOperatorConfig = clusterOperatorConfig;
+        this.secretOperator = supplier.secretOperations;
         this.initImage = System.getenv().getOrDefault(ClusterOperatorConfig.STRIMZI_DEFAULT_KAFKA_INIT_IMAGE, "quay.io/strimzi/operator:latest");
     }
 
@@ -284,6 +293,8 @@ public class KafkaCluster extends AbstractModel implements SupportsMetrics, Supp
      * @param kafkaMetadataConfigState      Represents the state of the Kafka metadata configuration
      * @param clusterId                     Kafka cluster Id (or null if it is not known yet)
      * @param sharedEnvironmentProvider     Shared environment provider
+     * @param clusterOperatorConfig         ClusterOperatorConfig instance
+     * @param supplier                      supplier for Secret
      *
      * @return Kafka cluster instance
      */
@@ -294,11 +305,13 @@ public class KafkaCluster extends AbstractModel implements SupportsMetrics, Supp
                                        KafkaVersionChange versionChange,
                                        KafkaMetadataConfigurationState kafkaMetadataConfigState,
                                        String clusterId,
-                                       SharedEnvironmentProvider sharedEnvironmentProvider) {
+                                       SharedEnvironmentProvider sharedEnvironmentProvider,
+                                       ClusterOperatorConfig clusterOperatorConfig,
+                                       ResourceOperatorSupplier supplier) {
         KafkaSpec kafkaSpec = kafka.getSpec();
         KafkaClusterSpec kafkaClusterSpec = kafkaSpec.getKafka();
 
-        KafkaCluster result = new KafkaCluster(reconciliation, kafka, sharedEnvironmentProvider);
+        KafkaCluster result = new KafkaCluster(reconciliation, kafka, sharedEnvironmentProvider, clusterOperatorConfig, supplier);
 
         result.clusterId = clusterId;
         result.nodePools = pools;
@@ -442,19 +455,12 @@ public class KafkaCluster extends AbstractModel implements SupportsMetrics, Supp
     }
 
     /**
-     * Generates list of Kafka node IDs that are going to be added to the Kafka cluster as brokers.
-     * This reports all broker nodes on cluster creation as well as the newly added ones on scaling up.
+     * Returns the list of KafkaNodePools for this KafkaCluster.
      *
-     * @return  Set of Kafka node IDs which are going to be added as brokers.
+     * @return List of KafkaNodePools
      */
-    public Set<NodeRef> addedNodes() {
-        Set<NodeRef> nodes = new LinkedHashSet<>();
-
-        for (KafkaPool pool : nodePools)    {
-            nodes.addAll(pool.scaleUpNodes());
-        }
-
-        return nodes;
+    public List<KafkaPool> getNodePools() {
+        return nodePools;
     }
 
     /**
@@ -466,7 +472,25 @@ public class KafkaCluster extends AbstractModel implements SupportsMetrics, Supp
         Set<Integer> nodes = new LinkedHashSet<>();
 
         for (KafkaPool pool : nodePools)    {
-            nodes.addAll(pool.scaledDownNodes().stream().map(NodeRef::nodeId).collect(Collectors.toSet()));
+            nodes.addAll(pool.scaledDownNodes());
+        }
+
+        return nodes;
+    }
+
+    /**
+     * Generates list of Kafka node IDs that are going to be added to the Kafka cluster as brokers.
+     * This reports all broker nodes on cluster creation as well as the newly added ones on scaling up.
+     *
+     * @return  Set of Kafka node IDs which are going to be added as brokers.
+     */
+    public Set<Integer> addedBrokerNodes() {
+        Set<Integer> nodes = new LinkedHashSet<>();
+
+        for (KafkaPool pool : nodePools)    {
+            if (pool.isBroker()) {
+                nodes.addAll(pool.scaleUpNodes());
+            }
         }
 
         return nodes;
@@ -775,11 +799,6 @@ public class KafkaCluster extends AbstractModel implements SupportsMetrics, Supp
                 if (loadBalancerClass != null) {
                     service.getSpec().setLoadBalancerClass(loadBalancerClass);
                 }
-
-                Boolean allocateLoadBalancerNodePorts = ListenersUtils.allocateLoadBalancerNodePorts(listener);
-                if (allocateLoadBalancerNodePorts != null) {
-                    service.getSpec().setAllocateLoadBalancerNodePorts(allocateLoadBalancerNodePorts);
-                }
             }
 
             if (KafkaListenerType.NODEPORT == listener.getType()) {
@@ -865,11 +884,6 @@ public class KafkaCluster extends AbstractModel implements SupportsMetrics, Supp
                             String loadBalancerClass = ListenersUtils.controllerClass(listener);
                             if (loadBalancerClass != null) {
                                 service.getSpec().setLoadBalancerClass(loadBalancerClass);
-                            }
-
-                            Boolean allocateLoadBalancerNodePorts = ListenersUtils.allocateLoadBalancerNodePorts(listener);
-                            if (allocateLoadBalancerNodePorts != null) {
-                                service.getSpec().setAllocateLoadBalancerNodePorts(allocateLoadBalancerNodePorts);
                             }
                         }
 
@@ -1185,8 +1199,8 @@ public class KafkaCluster extends AbstractModel implements SupportsMetrics, Supp
                                                Function<NodeRef, Map<String, String>> podAnnotationsProvider) {
         List<StrimziPodSet> podSets = new ArrayList<>();
 
-        for (KafkaPool pool : nodePools)    {
-            podSets.add(WorkloadUtils.createPodSet(
+        for (KafkaPool pool : nodePools) {
+            StrimziPodSet podSet = WorkloadUtils.createPodSet(
                     pool.componentName,
                     namespace,
                     pool.labels,
@@ -1213,10 +1227,52 @@ public class KafkaCluster extends AbstractModel implements SupportsMetrics, Supp
                             imagePullSecrets,
                             securityProvider.kafkaPodSecurityContext(new PodSecurityProviderContextImpl(pool.storage, pool.templatePod))
                     )
-            ));
+            );
+
+            // Use the cluster field directly
+            if (pool.getTargetCluster() != null) {
+                applyPodSetToRemoteCluster(pool.getTargetCluster(), podSet);
+            } else {
+                podSets.add(podSet);
+            }
         }
 
         return podSets;
+    }
+
+    private void applyPodSetToRemoteCluster(String targetCluster, StrimziPodSet podSet) {
+        ClusterInfo clusterInfo = clusterOperatorConfig.getK8sClusters().get(targetCluster);
+
+        if (clusterInfo == null) {
+            LOGGER.warnOp("No cluster information found for target cluster {}", targetCluster);
+            return;
+        }
+
+        try {
+            // Fetch the kubeconfig from the Kubernetes Secret
+            Secret secret = secretOperator.get(namespace, clusterInfo.getSecret());
+            if (secret == null) {
+                LOGGER.errorOp("Secret {} not found for cluster {}", clusterInfo.getSecret(), targetCluster);
+                return;
+            }
+
+            String kubeconfig = new String(Base64.getDecoder().decode(secret.getData().get("kubeconfig")));
+
+            // Create a Kubernetes client for the remote cluster
+            Config config = Config.fromKubeconfig(kubeconfig);
+            try (KubernetesClient remoteClient = new KubernetesClientBuilder().withConfig(config).build()) {
+                StrimziPodSet podSetWithoutOwnerRef  = new StrimziPodSetBuilder(podSet)
+                                                        .editMetadata()
+                                                        .withOwnerReferences(Collections.emptyList())
+                                                        .endMetadata()
+                                                        .build();
+                // Apply the StrimziPodSet to the remote cluster
+                remoteClient.resource(podSetWithoutOwnerRef).create();
+                LOGGER.infoOp("Successfully created StrimziPodSet {} in remote cluster {}", podSet.getMetadata().getName(), targetCluster);
+            }
+        } catch (Exception e) {
+            LOGGER.errorOp("Failed to create StrimziPodSet {} in remote cluster {}", podSet.getMetadata().getName(), targetCluster, e);
+        }
     }
 
     /**
@@ -1237,8 +1293,7 @@ public class KafkaCluster extends AbstractModel implements SupportsMetrics, Supp
         Map<String, CertAndKey> brokerCerts;
 
         try {
-            brokerCerts = clusterCa.generateBrokerCerts(namespace, cluster, CertUtils.extractCertsAndKeysFromSecret(existingSecret, nodes),
-                    nodes, externalBootstrapDnsName, externalDnsNames, isMaintenanceTimeWindowsSatisfied, clusterCa.hasCaCertGenerationChanged(existingSecret));
+            brokerCerts = clusterCa.generateBrokerCerts(namespace, cluster, existingSecret, nodes, externalBootstrapDnsName, externalDnsNames, isMaintenanceTimeWindowsSatisfied);
         } catch (IOException e) {
             LOGGER.warnCr(reconciliation, "Error while generating certificates", e);
             throw new RuntimeException("Failed to prepare Kafka certificates", e);
@@ -1693,8 +1748,8 @@ public class KafkaCluster extends AbstractModel implements SupportsMetrics, Supp
         List<NetworkPolicyIngressRule> rules = new ArrayList<>();
 
         // Control Plane rule covers the control plane listener.
-        // Control plane listener is used by Kafka for internal coordination only, but also by CO during rolling updates
-        rules.add(NetworkPolicyUtils.createIngressRule(CONTROLPLANE_PORT, List.of(kafkaClusterPeer, clusterOperatorPeer)));
+        // Control plane listener is used by Kafka for internal coordination only
+        rules.add(NetworkPolicyUtils.createIngressRule(CONTROLPLANE_PORT, List.of(kafkaClusterPeer)));
 
         // Replication rule covers the replication listener.
         // Replication listener is used by Kafka but also by our own tools => Operators, Cruise Control, and Kafka Exporter

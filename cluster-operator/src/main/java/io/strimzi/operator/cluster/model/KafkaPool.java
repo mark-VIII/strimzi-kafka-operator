@@ -73,6 +73,8 @@ public class KafkaPool extends AbstractModel {
     protected ResourceTemplate templatePerBrokerIngress;
     protected ContainerTemplate templateInitContainer;
 
+    private final String targetCluster;
+
     /**
      * Constructor
      *
@@ -118,6 +120,7 @@ public class KafkaPool extends AbstractModel {
 
         this.poolName = pool.getMetadata().getName();
         this.idAssignment = idAssignment;
+        this.targetCluster = pool.getSpec().getCluster();
     }
 
     /**
@@ -263,26 +266,6 @@ public class KafkaPool extends AbstractModel {
     }
 
     /**
-     * @return  Set of Kafka nodes that are going to be removed from the Kafka cluster
-     */
-    public Set<NodeRef> scaledDownNodes() {
-        return idAssignment.toBeRemoved()
-                .stream()
-                .map(this::nodeRef)
-                .collect(Collectors.toCollection(LinkedHashSet::new)); // we want this in deterministic order
-    }
-
-    /**
-     * @return  Set of Kafka nodes that are going to be added to the Kafka cluster
-     */
-    public Set<NodeRef> scaleUpNodes() {
-        return idAssignment.toBeAdded()
-                .stream()
-                .map(this::nodeRef)
-                .collect(Collectors.toCollection(LinkedHashSet::new)); // we want this in deterministic order
-    }
-
-    /**
      * Builds node reference from node ID
      *
      * @param nodeId    Node ID
@@ -337,9 +320,30 @@ public class KafkaPool extends AbstractModel {
     }
 
     /**
+     * @return  the set of Kafka node IDs going to be removed from the Kafka cluster.
+     */
+    public Set<Integer> scaledDownNodes() {
+        return idAssignment.toBeRemoved();
+    }
+
+    /**
+     * @return  the set of Kafka node IDs going to be added to the Kafka cluster.
+     */
+    public Set<Integer> scaleUpNodes() {
+        return idAssignment.toBeAdded();
+    }
+
+    /**
      * @return  the set of Kafka node IDs that used to have the broker role but do not have it anymore.
      */
     public Set<Integer> usedToBeBrokerNodes() {
         return idAssignment.usedToBeBroker();
+    }
+
+    /**
+     * @return  the targetCluster where the StrimziPodSet will be deployed
+     */
+    public String getTargetCluster() {
+        return targetCluster;
     }
 }
