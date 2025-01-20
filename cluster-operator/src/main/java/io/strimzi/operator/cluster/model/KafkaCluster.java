@@ -439,6 +439,15 @@ public class KafkaCluster extends AbstractModel implements SupportsMetrics, Supp
     }
 
     /**
+     * Returns the list of KafkaNodePools for this KafkaCluster.
+     *
+     * @return List of KafkaNodePools
+     */
+    public List<KafkaPool> getNodePools() {
+        return nodePools;
+    }
+
+    /**
      * Generates list of Kafka node IDs that are going to be removed from the Kafka cluster.
      *
      * @return  Set of Kafka node IDs which are going to be removed

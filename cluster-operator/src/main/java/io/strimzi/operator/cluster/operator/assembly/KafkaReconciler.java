@@ -9,6 +9,7 @@ import io.fabric8.kubernetes.api.model.LocalObjectReference;
 import io.fabric8.kubernetes.api.model.Node;
 import io.fabric8.kubernetes.api.model.PersistentVolumeClaim;
 import io.fabric8.kubernetes.api.model.Pod;
+import io.fabric8.kubernetes.api.model.Secret;
 import io.fabric8.kubernetes.api.model.rbac.ClusterRoleBinding;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.strimzi.api.kafka.model.common.Condition;
@@ -30,6 +31,7 @@ import io.strimzi.api.kafka.model.nodepool.KafkaNodePoolStatus;
 import io.strimzi.api.kafka.model.nodepool.KafkaNodePoolStatusBuilder;
 import io.strimzi.api.kafka.model.podset.StrimziPodSet;
 import io.strimzi.api.kafka.model.podset.StrimziPodSetBuilder;
+import io.strimzi.operator.cluster.ClusterInfo;
 import io.strimzi.operator.cluster.ClusterOperatorConfig;
 import io.strimzi.operator.cluster.PlatformFeaturesAvailability;
 import io.strimzi.operator.cluster.model.CertUtils;
@@ -99,6 +101,7 @@ import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static io.strimzi.operator.cluster.model.KafkaCluster.ANNO_STRIMZI_IO_KAFKA_VERSION;
 import static io.strimzi.operator.common.Annotations.ANNO_STRIMZI_SERVER_CERT_HASH;
@@ -131,6 +134,7 @@ public class KafkaReconciler {
     private final List<KafkaNodePool> kafkaNodePoolCrs;
     private final ClusterCa clusterCa;
     private final ClientsCa clientsCa;
+    private final Map<String, ClusterInfo> remoteClusters;
 
     // Tools for operating and managing various resources
     private final Vertx vertx;
@@ -164,6 +168,7 @@ public class KafkaReconciler {
     private final Map<Integer, String> brokerLoggingHash = new HashMap<>();
     private final Map<Integer, String> brokerConfigurationHash = new HashMap<>();
     private final Map<Integer, String> kafkaServerCertificateHash = new HashMap<>();
+
     /* test */ TlsPemIdentity coTlsPemIdentity;
     /* test */ KafkaListenersReconciler.ReconciliationResult listenerReconciliationResults; // Result of the listener reconciliation with the listener details
 
@@ -208,6 +213,7 @@ public class KafkaReconciler {
 
         this.clusterCa = clusterCa;
         this.clientsCa = clientsCa;
+        this.remoteClusters = config.getK8sClusters();
         this.maintenanceWindows = kafkaCr.getSpec().getMaintenanceTimeWindows();
         this.operatorNamespace = config.getOperatorNamespace();
         this.operatorNamespaceLabels = config.getOperatorNamespaceLabels();
@@ -746,11 +752,16 @@ public class KafkaReconciler {
      * @return      Completes when the Secret was successfully created or updated
      */
     protected Future<Void> certificateSecret(Clock clock) {
+        // Somehow this code needs to be modified to reconcile in both this (central) and remote clusters - need to figure out where to inject the extra method calls...
         return secretOperator.getAsync(reconciliation.namespace(), KafkaResources.kafkaSecretName(reconciliation.name()))
                 .compose(oldSecret -> {
-                    return secretOperator
-                            .reconcile(reconciliation, reconciliation.namespace(), KafkaResources.kafkaSecretName(reconciliation.name()),
-                                    kafka.generateCertificatesSecret(clusterCa, clientsCa, oldSecret, listenerReconciliationResults.bootstrapDnsNames, listenerReconciliationResults.brokerDnsNames, Util.isMaintenanceTimeWindowsSatisfied(reconciliation, maintenanceWindows, clock.instant())))
+                    Promise<Void> certUpdatePromise = Promise.promise();
+
+                    List<Future<ReconcileResult<Secret>>> secretReconciliations = new ArrayList<>(remoteClusters.size() + 1);
+
+                    Future<ReconcileResult<Secret>> centralSecretReconciliation = secretOperator.reconcile(reconciliation, reconciliation.namespace(),
+                            KafkaResources.kafkaSecretName(reconciliation.name()),
+                            kafka.generateCertificatesSecret(clusterCa, clientsCa, oldSecret, listenerReconciliationResults.bootstrapDnsNames, listenerReconciliationResults.brokerDnsNames, Util.isMaintenanceTimeWindowsSatisfied(reconciliation, maintenanceWindows, clock.instant())))
                             .compose(patchResult -> {
                                 if (patchResult != null) {
                                     for (NodeRef node : kafka.nodes()) {
@@ -764,7 +775,56 @@ public class KafkaReconciler {
 
                                 return Future.succeededFuture();
                             });
+                    secretReconciliations.add(centralSecretReconciliation);
+
+
+    
+                    Future.join(secretReconciliations).onComplete(res -> {
+                        if (res.succeeded()) {
+                            certUpdatePromise.complete();
+                        } else {
+                            certUpdatePromise.fail(res.cause());
+                        }
+                    });
+
+                    return certUpdatePromise.future();
+                    // return secretOperator
+                    //         .reconcile(reconciliation, reconciliation.namespace(), KafkaResources.kafkaSecretName(reconciliation.name()),
+                    //                 kafka.generateCertificatesSecret(clusterCa, clientsCa, oldSecret, listenerReconciliationResults.bootstrapDnsNames, listenerReconciliationResults.brokerDnsNames, Util.isMaintenanceTimeWindowsSatisfied(reconciliation, maintenanceWindows, clock.instant())))
+                    //         .compose(patchResult -> {
+                    //             if (patchResult != null) {
+                    //                 for (NodeRef node : kafka.nodes()) {
+                    //                     kafkaServerCertificateHash.put(
+                    //                             node.nodeId(),
+                    //                             CertUtils.getCertificateThumbprint(patchResult.resource(),
+                    //                                     Ca.SecretEntry.CRT.asKey(node.podName())
+                    //                             ));
+                    //                 }
+                    //             }
+
+                    //             return Future.succeededFuture();
+                    //         });
                 });
+    }
+
+    private Future<ReconcileResult<Secret>> reconcileRemoteClusterCertSecrets() {
+        if (remoteClusters.size() < 1) {
+            LOGGER.debugCr(reconciliation, "No remote clusters configured for cert reconcile");
+            return Future.succeededFuture(ReconcileResult.noop(null));
+        }
+
+        if (kafka.getNodePools() == null || kafka.getNodePools().isEmpty()) {
+            LOGGER.warnCr(reconciliation, "No KafkaNodePools found. Skipping broker certificate reconciliation for remote clusters.");
+            return Future.succeededFuture(ReconcileResult.noop(null));
+        }
+
+        List<Future<ReconcileResult>> remoteClusterSecretFutures = kafka.getNodePools().stream()
+            .filter(pool -> pool.getTargetCluster() != null)
+            .flatMap(pool -> Stream.of(
+                getRemoteSecret()
+                    .compose()
+            ))
+            .toList();
     }
 
     /**
