@@ -1234,8 +1234,11 @@ public class KafkaCluster extends AbstractModel implements SupportsMetrics, Supp
         Set<NodeRef> nodes = nodes();
         Map<String, CertAndKey> brokerCerts;
 
+        // TODO: Can we get node pools info here? We need the clusterId for each node pool within 'generateBrokerCerts'.
+        List<KafkaPool> pools = this.getNodePools();
+
         try {
-            brokerCerts = clusterCa.generateBrokerCerts(namespace, cluster, existingSecret, nodes, externalBootstrapDnsName, externalDnsNames, isMaintenanceTimeWindowsSatisfied);
+            brokerCerts = clusterCa.generateBrokerCerts(namespace, cluster, existingSecret, nodes, pools, externalBootstrapDnsName, externalDnsNames, isMaintenanceTimeWindowsSatisfied);
         } catch (IOException e) {
             LOGGER.warnCr(reconciliation, "Error while generating certificates", e);
             throw new RuntimeException("Failed to prepare Kafka certificates", e);

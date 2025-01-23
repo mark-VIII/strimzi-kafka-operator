@@ -28,6 +28,7 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.regex.Pattern;
@@ -209,6 +210,7 @@ public class ClusterCa extends Ca {
             String clusterName,
             Secret existingSecret,
             Set<NodeRef> nodes,
+            List<KafkaPool> pools,
             Set<String> externalBootstrapAddresses,
             Map<Integer, Set<String>> externalAddresses,
             boolean isMaintenanceTimeWindowsSatisfied
@@ -223,6 +225,15 @@ public class ClusterCa extends Ca {
 
             subject.addDnsName(DnsNameGenerator.podDnsName(namespace, KafkaResources.brokersServiceName(clusterName), node.podName()));
             subject.addDnsName(DnsNameGenerator.podDnsNameWithoutClusterDomain(namespace, KafkaResources.brokersServiceName(clusterName), node.podName()));
+
+            if (pools != null && !pools.isEmpty()) {
+                // Match the node to the pool by name and then get the clusterId from the pool
+                Optional<KafkaPool> currentNodePool = pools.stream().filter(pool -> pool.poolName.equals(node.poolName())).findFirst();
+
+                if (!currentNodePool.isEmpty()) {
+                    subject.addDnsName(DnsNameGenerator.podDnsName(namespace, KafkaResources.brokersServiceName(clusterName), node.podName(), currentNodePool.get().getTargetCluster()));
+                }
+            }
 
             // Controller-only nodes do not have the SANs for external listeners.
             // That helps us to avoid unnecessary rolling updates when the SANs change

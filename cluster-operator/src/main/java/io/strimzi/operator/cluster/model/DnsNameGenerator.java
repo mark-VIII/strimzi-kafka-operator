@@ -63,6 +63,7 @@ public class DnsNameGenerator {
      * Note: Conventionally this would only be used for pods with deterministic names such as StrimziPodSet pods
      *
      * @param podName       Name of the pod
+     * @param clusterId     Identifier for the Kubernetes cluster in a Multi-Cluster environment
      *
      * @return              DNS name of the pod
      */
@@ -163,6 +164,8 @@ public class DnsNameGenerator {
      * Generates the DNS name of the service when using a Multi-Cluster service (MCS)
      * (see https://github.com/kubernetes/enhancements/tree/master/keps/sig-multicluster/1645-multi-cluster-services-api)
      * Example: clusterId.my-service.my-ns.svc.clusterset.local
+     * 
+     * @param clusterId     Identifier for the Kubernetes cluster in a Multi-Cluster environment
      *
      * @return              DNS name of the service
      */
@@ -171,7 +174,7 @@ public class DnsNameGenerator {
                 clusterId,
                 serviceName,
                 namespace,
-                KUBERNETES_SERVICE_DNS_DOMAIN);
+                "clusterset.local");
     }
 
     /**
