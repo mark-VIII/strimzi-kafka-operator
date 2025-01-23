@@ -10,8 +10,11 @@ import io.fabric8.kubernetes.api.model.Node;
 import io.fabric8.kubernetes.api.model.PersistentVolumeClaim;
 import io.fabric8.kubernetes.api.model.Pod;
 import io.fabric8.kubernetes.api.model.Secret;
+import io.fabric8.kubernetes.api.model.SecretBuilder;
 import io.fabric8.kubernetes.api.model.rbac.ClusterRoleBinding;
+import io.fabric8.kubernetes.client.Config;
 import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.KubernetesClientBuilder;
 import io.strimzi.api.kafka.model.common.Condition;
 import io.strimzi.api.kafka.model.kafka.Kafka;
 import io.strimzi.api.kafka.model.kafka.KafkaResources;
@@ -90,6 +93,8 @@ import org.apache.kafka.common.KafkaException;
 
 import java.time.Clock;
 import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -756,10 +761,11 @@ public class KafkaReconciler {
                 .compose(oldSecret -> {
                     Promise<Void> certUpdatePromise = Promise.promise();
 
-                    List<Future<ReconcileResult<Secret>>> secretReconciliations = new ArrayList<>(remoteClusters.size() + 1);
+                    List<Future<Void>> secretReconciliations = new ArrayList<>(remoteClusters.size() + 1);
 
                     // TODO: The secret needs to be generated with the appropriate SANs
-                    // Seems the most obvious way is to alter 'brokerDnsNames' that comes from listener reconciliation
+                    // Think I'm going to have to get the NodePools from the kafka instance here (or in the following method) and pass them through into the generateCertificates flow
+                    // We then need to get the clusterId from the node pool by matching a node to a nodepool via the pool name.
                     Secret newSecret = kafka.generateCertificatesSecret(
                         clusterCa,
                         clientsCa,
@@ -768,8 +774,10 @@ public class KafkaReconciler {
                         listenerReconciliationResults.brokerDnsNames,
                         Util.isMaintenanceTimeWindowsSatisfied(reconciliation, maintenanceWindows, clock.instant()));
 
-                    Future<ReconcileResult<Secret>> centralSecretReconciliation = secretOperator.reconcile(reconciliation, reconciliation.namespace(),
-                            KafkaResources.kafkaSecretName(reconciliation.name()),
+                    String secretName = KafkaResources.kafkaSecretName(reconciliation.name());
+
+                    Future<Void> centralSecretReconciliation = secretOperator.reconcile(reconciliation, reconciliation.namespace(),
+                            secretName,
                             newSecret)
                             .compose(patchResult -> {
                                 if (patchResult != null) {
@@ -783,18 +791,19 @@ public class KafkaReconciler {
                                 }
 
                                 return Future.succeededFuture();
-                            });
+                            })
+                            .map((Void) null);
                     secretReconciliations.add(centralSecretReconciliation);
 
+                    // Add a new reconciliation for remote clusters if any are configured
                     if (remoteClusters.size() >= 1) {
-                        Future<ReconcileResult<Secret>> remoteSecretReconciliation = reconcileRemoteClusterCertSecrets(newSecret);
+                        Future<Void> remoteSecretReconciliation = reconcileRemoteClusterCertSecrets(secretName, newSecret);
                         // TODO: Likely needs a follow on action in the same manner as the central secret
                         secretReconciliations.add(remoteSecretReconciliation);
                     } else {
                         LOGGER.infoCr(reconciliation, "No remote clusters configured for cert reconcile");
                     }
-                    
-    
+
                     Future.join(secretReconciliations).onComplete(res -> {
                         if (res.succeeded()) {
                             certUpdatePromise.complete();
@@ -804,52 +813,76 @@ public class KafkaReconciler {
                     });
 
                     return certUpdatePromise.future();
-
-                    // ORIGINAL CODE:
-                    // return secretOperator
-                    //         .reconcile(reconciliation, reconciliation.namespace(), KafkaResources.kafkaSecretName(reconciliation.name()),
-                    //                 kafka.generateCertificatesSecret(clusterCa, clientsCa, oldSecret, listenerReconciliationResults.bootstrapDnsNames, listenerReconciliationResults.brokerDnsNames, Util.isMaintenanceTimeWindowsSatisfied(reconciliation, maintenanceWindows, clock.instant())))
-                    //         .compose(patchResult -> {
-                    //             if (patchResult != null) {
-                    //                 for (NodeRef node : kafka.nodes()) {
-                    //                     kafkaServerCertificateHash.put(
-                    //                             node.nodeId(),
-                    //                             CertUtils.getCertificateThumbprint(patchResult.resource(),
-                    //                                     Ca.SecretEntry.CRT.asKey(node.podName())
-                    //                             ));
-                    //                 }
-                    //             }
-
-                    //             return Future.succeededFuture();
-                    //         });
                 });
     }
 
-    private Future<ReconcileResult<Secret>> reconcileRemoteClusterCertSecrets(Secret secret) {
-        // if (remoteClusters.size() < 1) {
-        //     LOGGER.debugCr(reconciliation, "No remote clusters configured for cert reconcile");
-        //     return Future.succeededFuture(ReconcileResult.noop(null));
-        // }
-
+    private Future<Void> reconcileRemoteClusterCertSecrets(String secretName, Secret secret) {
+        
         if (kafka.getNodePools() == null || kafka.getNodePools().isEmpty()) {
             LOGGER.warnCr(reconciliation, "No KafkaNodePools found. Skipping broker certificate reconciliation for remote clusters.");
-            return Future.succeededFuture(ReconcileResult.noop(null));
+            return Future.succeededFuture();
         }
 
-        List<Future<ReconcileResult<Secret>>> remoteClusterSecretFutures = kafka.getNodePools().stream()
+        List<Future<Void>> remoteClusterSecretFutures = kafka.getNodePools().stream()
             .filter(pool -> pool.getTargetCluster() != null)
             .flatMap(pool -> Stream.of(
-                applySecretToRemoteCluster(pool.getTargetCluster())
+                applySecretToRemoteCluster(pool.getTargetCluster(), secret, secretName)
             ))
             .toList();
 
-        return Future.join(remoteClusterSecretFutures).map(future -> ReconcileResult.noop(null));
+        return Future.join(remoteClusterSecretFutures).map((Void) null);
     }
 
     // TODO: Should be able to use a common function (e.g. the one used by Aswin's modified CaReconciler)
-    private Future<ReconcileResult<Secret>> applySecretToRemoteCluster(String targetCluster) {
-        LOGGER.infoCr(reconciliation, "Applying new secret on remote cluster: " + targetCluster);
-        return Future.succeededFuture(ReconcileResult.noop(null));
+    private Future<Void> applySecretToRemoteCluster(String targetCluster, Secret secret, String secretName) {
+        ClusterInfo clusterInfo = remoteClusters.get(targetCluster);
+
+        if (clusterInfo == null) {
+            LOGGER.warnOp("No cluster information found for target cluster {}", targetCluster);
+            return Future.succeededFuture(); // Skip this cluster
+        }
+
+        try {
+            // Fetch the kubeconfig from the Kubernetes Secret
+            Secret kubeconfigSecret = secretOperator.get(reconciliation.namespace(), clusterInfo.getSecret());
+            if (kubeconfigSecret == null) {
+                LOGGER.errorOp("Secret {} not found for cluster {}", clusterInfo.getSecret(), targetCluster);
+                return Future.failedFuture("Kubeconfig Secret not found for cluster " + targetCluster);
+            }
+
+            String kubeconfig = new String(Base64.getDecoder().decode(kubeconfigSecret.getData().get("kubeconfig")));
+
+            // Create a Kubernetes client for the remote cluster
+            Config config = Config.fromKubeconfig(kubeconfig);
+            KubernetesClient remoteClient = new KubernetesClientBuilder().withConfig(config).build();
+
+            // Check if the Secret already exists in the remote cluster
+            Secret existingSecret = remoteClient.secrets()
+                .inNamespace(secret.getMetadata().getNamespace())
+                .withName(secretName)
+                .get();
+
+            if (existingSecret != null) {
+                LOGGER.infoOp("Secret {} already exists in remote cluster {}", secretName, targetCluster);
+                return Future.succeededFuture(); // Skip creation
+            }
+
+            // Remove ownerReferences for remote clusters
+            Secret remoteSecret = new SecretBuilder(secret)
+                .editMetadata()
+                    .withOwnerReferences(Collections.emptyList())
+                .endMetadata()
+                .build();
+
+            // Apply the Secret to the remote cluster
+            remoteClient.resource(remoteSecret).create();
+            LOGGER.infoOp("Successfully created Secret {} in remote cluster {}", secretName, targetCluster);
+
+            return Future.succeededFuture();
+        } catch (Exception e) {
+            LOGGER.errorOp("Failed to create Secret {} in remote cluster {}", secretName, targetCluster, e);
+            return Future.failedFuture(e);
+        }
     }
 
     /**
