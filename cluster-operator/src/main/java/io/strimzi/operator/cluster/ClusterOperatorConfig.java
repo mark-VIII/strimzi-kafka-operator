@@ -212,6 +212,11 @@ public class ClusterOperatorConfig {
     public static final ConfigParameter<Boolean> POD_SET_RECONCILIATION_ONLY = new ConfigParameter<>("STRIMZI_POD_SET_RECONCILIATION_ONLY", BOOLEAN, "false", CONFIG_VALUES);
 
     /**
+     * Environment Variable for K8sClusters
+     */
+    public static final ConfigParameter<String> K8S_CLUSTERS = new ConfigParameter<>("STRIMZI_K8S_CLUSTERS", STRING, null, CONFIG_VALUES);
+
+    /**
      * Indicates the size of the StrimziPodSetController work queue
      */
     public static final ConfigParameter<Integer> POD_SET_CONTROLLER_WORK_QUEUE_SIZE = new ConfigParameter<>("STRIMZI_POD_SET_CONTROLLER_WORK_QUEUE_SIZE", INTEGER, "1024", CONFIG_VALUES);
@@ -258,6 +263,20 @@ public class ClusterOperatorConfig {
      * The configured Kafka versions
      */
     private final KafkaVersion.Lookup versions;
+
+    /**
+     * Variable for k8sClusters
+     */
+    private Map<String, ClusterInfo> k8sClusters;
+
+    /**
+     * Gets the Linked Kubernetes cluster details.
+     *
+     * @return The k8sClusters list.
+     */
+    public Map<String, ClusterInfo> getK8sClusters() {
+        return k8sClusters;
+    }
 
     /**
      * Logs warnings for removed / deprecated environment variables
@@ -322,6 +341,37 @@ public class ClusterOperatorConfig {
     private ClusterOperatorConfig(Map<String, Object> map, KafkaVersion.Lookup lookup) {
         this.versions = lookup;
         this.map = map;
+
+        this.k8sClusters = parseK8SClusters((String) map.get(K8S_CLUSTERS.key()));
+    }
+
+    // I think I should Optimize this, Not really happy with the way I extract
+    // Secret. This should work for the time being. This is really a brute force
+    // Approach that can be Optimized later to make it more efficient.
+    private Map<String, ClusterInfo> parseK8SClusters(String clustersEnvVar) {
+        Map<String, ClusterInfo> clusters = new HashMap<>();
+        if (clustersEnvVar != null) {
+            String[] entries = clustersEnvVar.split("\n");
+            for (String entry : entries) {
+                String[] keyValue = entry.split("=", 2);
+                if (keyValue.length == 2) {
+                    String[] clusterAndField = keyValue[0].split("\\.", 2);
+                    if (clusterAndField.length == 2) {
+                        String clusterName = clusterAndField[0];
+                        String field = clusterAndField[1];
+                        clusters.computeIfAbsent(clusterName, k -> new ClusterInfo(null, null));
+                        ClusterInfo clusterInfo = clusters.get(clusterName);
+
+                        if ("url".equals(field)) {
+                            clusters.put(clusterName, new ClusterInfo(keyValue[1], clusterInfo.getSecret()));
+                        } else if ("secret".equals(field)) {
+                            clusters.put(clusterName, new ClusterInfo(clusterInfo.getUrl(), keyValue[1]));
+                        }
+                    }
+                }
+            }
+        }
+        return clusters;
     }
 
     /**

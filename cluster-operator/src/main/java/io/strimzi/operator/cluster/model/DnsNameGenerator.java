@@ -57,6 +57,23 @@ public class DnsNameGenerator {
     }
 
     /**
+     * Generates the DNS name of the pod including the cluster suffix for a Multi-Cluster environment/service
+     * Example: my-pod-1.clusterId.my-service.my-ns.svc.clusterset.local
+     *
+     * Note: Conventionally this would only be used for pods with deterministic names such as StrimziPodSet pods
+     *
+     * @param podName       Name of the pod
+     * @param clusterId     Identifier for the Kubernetes cluster in a Multi-Cluster environment
+     *
+     * @return              DNS name of the pod
+     */
+    public String podDnsName(String podName, String clusterId) {
+        return String.format("%s.%s",
+                podName,
+                serviceDnsName(clusterId));
+    }
+
+    /**
      * Generates a DNS name of a Pod
      *
      * @param namespace     Namespace of the Pod
@@ -68,6 +85,21 @@ public class DnsNameGenerator {
     public static String podDnsName(String namespace, String serviceName, String podName) {
         return DnsNameGenerator.of(namespace, serviceName)
                 .podDnsName(podName);
+    }
+
+    /**
+     * Generates a DNS name of a Pod in a Multi-Cluster environment
+     *
+     * @param namespace     Namespace of the Pod
+     * @param serviceName   Name of the headless service
+     * @param podName       Name of the Pod
+     * @param clusterId     Identifier for the Kubernetes cluster in a Multi-Cluster environment
+     *
+     * @return  Pod DNS name
+     */
+    public static String podDnsName(String namespace, String serviceName, String podName, String clusterId) {
+        return DnsNameGenerator.of(namespace, serviceName)
+                .podDnsName(podName, clusterId);
     }
 
     /**
@@ -126,6 +158,23 @@ public class DnsNameGenerator {
                 serviceName,
                 namespace,
                 KUBERNETES_SERVICE_DNS_DOMAIN);
+    }
+
+    /**
+     * Generates the DNS name of the service when using a Multi-Cluster service (MCS)
+     * (see https://github.com/kubernetes/enhancements/tree/master/keps/sig-multicluster/1645-multi-cluster-services-api)
+     * Example: clusterId.my-service.my-ns.svc.clusterset.local
+     * 
+     * @param clusterId     Identifier for the Kubernetes cluster in a Multi-Cluster environment
+     *
+     * @return              DNS name of the service
+     */
+    public String serviceDnsName(String clusterId) {
+        return String.format("%s.%s.%s.svc.%s",
+                clusterId,
+                serviceName,
+                namespace,
+                "clusterset.local");
     }
 
     /**

@@ -207,6 +207,7 @@ public class ClusterCa extends Ca {
     protected Map<String, CertAndKey> generateBrokerCerts(
             String namespace,
             String clusterName,
+            String targetClusterId,
             Secret existingSecret,
             Set<NodeRef> nodes,
             Set<String> externalBootstrapAddresses,
@@ -223,6 +224,10 @@ public class ClusterCa extends Ca {
 
             subject.addDnsName(DnsNameGenerator.podDnsName(namespace, KafkaResources.brokersServiceName(clusterName), node.podName()));
             subject.addDnsName(DnsNameGenerator.podDnsNameWithoutClusterDomain(namespace, KafkaResources.brokersServiceName(clusterName), node.podName()));
+
+            if (targetClusterId != null) {
+                subject.addDnsName(DnsNameGenerator.podDnsName(namespace, KafkaResources.brokersServiceName(clusterName), node.podName(), targetClusterId));
+            }
 
             // Controller-only nodes do not have the SANs for external listeners.
             // That helps us to avoid unnecessary rolling updates when the SANs change
