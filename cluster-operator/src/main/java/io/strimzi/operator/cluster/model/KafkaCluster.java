@@ -95,6 +95,7 @@ import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -1221,6 +1222,7 @@ public class KafkaCluster extends AbstractModel implements SupportsMetrics, Supp
      * Generates the private keys for the Kafka brokers (if needed) and the secret with them which contains both the
      * public and private keys.
      *
+     * @param targetClusterId                       The ID of the target remote cluster (if null, this secret is for central cluster)
      * @param clusterCa                             The CA for cluster certificates
      * @param clientsCa                             The CA for clients certificates
      * @param existingSecret                        The existing secret with Kafka certificates
@@ -1230,15 +1232,26 @@ public class KafkaCluster extends AbstractModel implements SupportsMetrics, Supp
      *
      * @return  The generated Secret with broker certificates
      */
-    public Secret generateCertificatesSecret(ClusterCa clusterCa, ClientsCa clientsCa, Secret existingSecret, Set<String> externalBootstrapDnsName, Map<Integer, Set<String>> externalDnsNames, boolean isMaintenanceTimeWindowsSatisfied) {
+    public Secret generateCertificatesSecret(String targetClusterId, ClusterCa clusterCa, ClientsCa clientsCa, Secret existingSecret, Set<String> externalBootstrapDnsName, Map<Integer, Set<String>> externalDnsNames, boolean isMaintenanceTimeWindowsSatisfied) {
         Set<NodeRef> nodes = nodes();
         Map<String, CertAndKey> brokerCerts;
 
-        // TODO: Can we get node pools info here? We need the clusterId for each node pool within 'generateBrokerCerts'.
-        List<KafkaPool> pools = this.getNodePools();
+        Set<NodeRef> desiredNodes = new LinkedHashSet<>();
+
+        if (this.getNodePools() == null || this.getNodePools().isEmpty()) {
+            // This Kafka cluster is not configured to use node pools: stretch clusters are non supported and the set of nodes should be unmodified
+            desiredNodes = nodes;
+        } else {
+            for (NodeRef node : nodes) {
+                KafkaPool pool = this.nodePoolForNodeId(node.nodeId());
+                if (Objects.equals(pool.getTargetCluster(), targetClusterId)) {
+                    desiredNodes.add(node);
+                }
+            }
+        }
 
         try {
-            brokerCerts = clusterCa.generateBrokerCerts(namespace, cluster, existingSecret, nodes, pools, externalBootstrapDnsName, externalDnsNames, isMaintenanceTimeWindowsSatisfied);
+            brokerCerts = clusterCa.generateBrokerCerts(namespace, cluster, targetClusterId, existingSecret, desiredNodes, externalBootstrapDnsName, externalDnsNames, isMaintenanceTimeWindowsSatisfied);
         } catch (IOException e) {
             LOGGER.warnCr(reconciliation, "Error while generating certificates", e);
             throw new RuntimeException("Failed to prepare Kafka certificates", e);
